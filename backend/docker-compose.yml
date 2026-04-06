@@ -1,0 +1,214 @@
+version: "3.9"
+
+services:
+  # ── Infrastructure ────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pricetracker
+      POSTGRES_USER: pt_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pt_user -d pricetracker"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollamadata:/root/.ollama
+    ports:
+      - "11434:11434"
+    # Pull llama3.2:3b on first start
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull llama3.2:3b && wait"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ── API Server ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./api:/app/api
+      - ./scraper:/app/scraper
+      - ./proxy:/app/proxy
+      - ./notifications:/app/notifications
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Celery Beat Scheduler ─────────────────────────────────────────────────
+  celery-beat:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    command: celery -A worker.celery_app beat --loglevel=info --scheduler celery.beat:PersistentScheduler
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./worker:/app/worker
+      - ./scraper:/app/scraper
+      - ./proxy:/app/proxy
+      - ./notifications:/app/notifications
+      - celerybeat:/app/celerybeat
+
+  # ── Scrape Workers (critical tier) ───────────────────────────────────────
+  worker-scrape-critical:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery_app worker
+      -Q scrape_critical
+      --concurrency=1
+      --max-tasks-per-child=50
+      --loglevel=info
+      -n worker-critical@%h
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./worker:/app/worker
+      - ./scraper:/app/scraper
+      - ./proxy:/app/proxy
+      - ./notifications:/app/notifications
+
+  # ── Scrape Workers (normal tier) ──────────────────────────────────────────
+  worker-scrape-normal:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery_app worker
+      -Q scrape_normal
+      --concurrency=1
+      --max-tasks-per-child=50
+      --loglevel=info
+      -n worker-normal@%h
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./worker:/app/worker
+      - ./scraper:/app/scraper
+      - ./proxy:/app/proxy
+      - ./notifications:/app/notifications
+
+  # ── Notification Worker ───────────────────────────────────────────────────
+  worker-notifications:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery_app worker
+      -Q notifications
+      --concurrency=4
+      --loglevel=info
+      -n worker-notify@%h
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./worker:/app/worker
+      - ./scraper:/app/scraper
+      - ./proxy:/app/proxy
+      - ./notifications:/app/notifications
+
+  # ── Maintenance Worker ────────────────────────────────────────────────────
+  worker-maintenance:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery_app worker
+      -Q maintenance
+      --concurrency=2
+      --loglevel=info
+      -n worker-maintenance@%h
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./worker:/app/worker
+      - ./scraper:/app/scraper
+      - ./proxy:/app/proxy
+      - ./notifications:/app/notifications
+
+  # ── Flower (Celery monitoring UI) ─────────────────────────────────────────
+  flower:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    command: celery -A worker.celery_app flower --port=5555
+    env_file: .env
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  ollamadata:
+  celerybeat:
